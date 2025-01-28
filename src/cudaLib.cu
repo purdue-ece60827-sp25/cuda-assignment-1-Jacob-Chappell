@@ -27,7 +27,7 @@ int runGpuSaxpy(int vectorSize) {
 	float * y = (float *)malloc(vectorSize * sizeof(float));
 	float * result = (float *)malloc(vectorSize * sizeof(float));
 
-	if(!x || !y) {
+	if(!x || !y || !result) {
 		std::cout << "Malloc failed";
 		return -1;
 	}
@@ -87,15 +87,37 @@ int runGpuSaxpy(int vectorSize) {
 
 */
 
+#include <curand_kernel.h>
+
+// generate n random points and calculate the hits
 __global__
 void generatePoints (uint64_t * pSums, uint64_t pSumSize, uint64_t sampleSize) {
-	//	Insert code here
+	int thr_i = blockDim.x * blockIdx.x + threadIdx.x;
+	if(thr_i >= pSumSize) return;
+	int i;
+	
+	curandState_t rng;
+	curand_init(clock64(), thr_i, 0, &rng);
+
+	pSums[thr_i] = 0; // zero hits so far
+	for(i = 0; i < sampleSize; i ++) {
+		float x, y;
+		x = curand_uniform(&rng); y = curand_uniform(&rng);
+		if(x*x + y*y <= 1.0f) pSums[thr_i] ++;
+	}
 }
 
+// reduce the sums into the subtotals
 __global__ 
 void reduceCounts (uint64_t * pSums, uint64_t * totals, uint64_t pSumSize, uint64_t reduceSize) {
-	//	Insert code here
+	int thr_i = blockDim.x * blockIdx.x + threadIdx.x;
+	int i;
+
+	totals[thr_i] = 0;
+	for(i = 0; i < reduceSize; i ++) 
+		if(i + thr_i * reduceSize < pSumSize) totals[thr_i] += pSums[i + thr_i * reduceSize];
 }
+
 
 int runGpuMCPi (uint64_t generateThreadCount, uint64_t sampleSize, 
 	uint64_t reduceThreadCount, uint64_t reduceSize) {
@@ -125,11 +147,44 @@ int runGpuMCPi (uint64_t generateThreadCount, uint64_t sampleSize,
 
 double estimatePi(uint64_t generateThreadCount, uint64_t sampleSize, 
 	uint64_t reduceThreadCount, uint64_t reduceSize) {
-	
+	int i;
+
 	double approxPi = 0;
 
-	//      Insert code here
-	std::cout << "Sneaky, you are ...\n";
-	std::cout << "Compute pi, you must!\n";
+	uint64_t * totals = (uint64_t *)malloc(reduceThreadCount * sizeof(uint64_t));
+	uint64_t * sums = (uint64_t *)malloc(generateThreadCount * sizeof(uint64_t));
+
+	if(!totals || !sums) {
+		std::cout << "Malloc failed";
+		return -1;
+	}
+
+	// assemble and launch generate kernel
+	uint64_t * gpu_sums;
+	cudaMalloc(&gpu_sums, generateThreadCount * sizeof(uint64_t));
+	uint64_t * gpu_totals;
+	cudaMalloc(&gpu_totals, reduceThreadCount * sizeof(uint64_t));
+
+	int threadsPerBlock = 256;
+	int blocks = (generateThreadCount + threadsPerBlock - 1) / threadsPerBlock;
+	generatePoints<<<blocks, threadsPerBlock>>>(gpu_sums, generateThreadCount, sampleSize);
+
+	// immediately launch reduce kernel as it uses data already on the gpu
+	blocks = (reduceThreadCount + threadsPerBlock - 1) / threadsPerBlock;
+	reduceCounts<<<blocks, threadsPerBlock>>>(gpu_sums, gpu_totals, generateThreadCount, reduceSize);
+
+	cudaMemcpy(sums, gpu_sums, generateThreadCount * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+	cudaMemcpy(totals, gpu_totals, reduceThreadCount * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+	cudaFree(gpu_sums);
+	cudaFree(gpu_totals);
+
+	uint64_t hits = 0;
+	for(i = 0; i < reduceThreadCount; i ++) hits += totals[i];
+	free(totals);
+	free(sums);
+
+	approxPi = (double)(hits) / (double)(generateThreadCount * sampleSize) * 4;
+
 	return approxPi;
 }
